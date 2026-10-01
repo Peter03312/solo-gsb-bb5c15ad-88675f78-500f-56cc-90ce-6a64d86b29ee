@@ -10,6 +10,9 @@
   与评语 (按发布序号隔离; 每个有效槽位至多一份, 以收据 receipt 标识;
   补位发布时连续保留的确认槽位连同评语一起复制到新序号);
 - reviewer_recusals 表保存评审人声明过的硬回避, 后续普通求解与补位都必须遵守;
+- reviewers.active 标记评审资格 (1=启用, 既有评审人初始即启用; 0=停用),
+  reviewer_status_changes 表保存会务方停用/启用的变更记录 (仅有效变更写入;
+  匹配修订号下重复提交同一状态和原因为幂等请求, 不推进修订号、不写记录);
 - feedback_snapshots 表保存会务方按论文发布的、面向作者的匿名反馈快照
   (仅当某发布序号下两名评审人均已确认且各提交一份正式评语时生成;
   以 (paper_id, serial, receipt1, receipt2) 幂等, 来源变化即新发布序号 -> version+1
@@ -42,7 +45,8 @@ CREATE TABLE IF NOT EXISTS reviewers (
     topics       TEXT NOT NULL,   -- JSON array
     institution  TEXT NOT NULL,
     capacity     INTEGER NOT NULL CHECK (capacity >= 1),
-    avoid_papers TEXT NOT NULL    -- JSON array
+    avoid_papers TEXT NOT NULL,   -- JSON array
+    active       INTEGER NOT NULL DEFAULT 1  -- 评审资格: 1=启用(既有评审人初始即启用), 0=停用
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -90,6 +94,16 @@ CREATE TABLE IF NOT EXISTS reviewer_recusals (
     created_at       TEXT NOT NULL,
     PRIMARY KEY (reviewer_id, paper_id)
 );
+-- 评审资格 (启用/停用) 变更记录, 仅供会务方追溯。仅有效变更写入;
+-- 匹配修订号下重复提交同一状态和原因属于幂等请求, 不产生新记录。
+CREATE TABLE IF NOT EXISTS reviewer_status_changes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    reviewer_id   TEXT NOT NULL,
+    active        INTEGER NOT NULL,           -- 变更后的目标状态: 1=启用, 0=停用
+    reason        TEXT NOT NULL,              -- 会务方填写的非空原因
+    revision      INTEGER NOT NULL,           -- 本次有效变更推进后的资料修订号
+    changed_at    TEXT NOT NULL
+);
 -- 面向作者的匿名反馈快照 (会务方按论文发布; 仅当该发布序号下两名评审人均已确认
 -- 且各提交一份正式评语时才允许生成)。
 -- receipt1/receipt2 按方案槽位固定顺序 (评审人编号字典序) 记录两份评语的收据,
@@ -118,6 +132,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(published)").fetchall()}
     if "serial" not in cols:
         conn.execute("ALTER TABLE published ADD COLUMN serial INTEGER NOT NULL DEFAULT 0")
+    reviewer_cols = {r["name"] for r in conn.execute("PRAGMA table_info(reviewers)").fetchall()}
+    if "active" not in reviewer_cols:
+        # 既有评审人初始视为启用
+        conn.execute("ALTER TABLE reviewers ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
 
 
 def get_conn() -> sqlite3.Connection:

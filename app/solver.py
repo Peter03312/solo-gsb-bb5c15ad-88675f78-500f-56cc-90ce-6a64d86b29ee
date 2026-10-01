@@ -35,6 +35,7 @@ class Reviewer:
     institution: str
     capacity: int
     avoid_papers: frozenset
+    active: bool = True
 
 
 def is_expert(reviewer: Reviewer, paper: Paper) -> bool:
@@ -53,7 +54,9 @@ def analyze_paper(paper: Paper, reviewers, recused_pairs=()):
     """
     eligible, excluded = [], []
     for r in reviewers:  # callers 保证 reviewers 已按 reviewer_id 升序
-        if r.institution in paper.institutions:
+        if not r.active:
+            excluded.append({"reviewer_id": r.reviewer_id, "reason": "reviewer_disabled"})
+        elif r.institution in paper.institutions:
             excluded.append({"reviewer_id": r.reviewer_id, "reason": "same_institution_as_author"})
         elif paper.paper_id in r.avoid_papers:
             reason = (
@@ -331,6 +334,8 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=()):
             seen.add(rid)
             if rid not in reviewer_by_id:
                 problems.append({"reviewer_id": rid, "reason": "fixed_reviewer_not_found"})
+            elif not reviewer_by_id[rid].active:
+                problems.append({"reviewer_id": rid, "reason": "fixed_reviewer_disabled"})
             elif rid in excluded_reason:
                 if (rid, pid) in recused_pairs:
                     problems.append({"reviewer_id": rid, "reason": "hard_recusal_after_decline"})

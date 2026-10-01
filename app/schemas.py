@@ -60,3 +60,10 @@ class ReviewSubmissionIn(BaseModel):
 
 class SnapshotPublishIn(BaseModel):
     serial: int = Field(ge=1, description="要发布的反馈快照所依据的发布序号; 与当前发布序号不一致即过期")
+
+
+class ReviewerStatusIn(BaseModel):
+    reviewer_id: str = Field(min_length=1, max_length=128, description="要调整资格的评审人编号")
+    base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
+    active: bool = Field(description="目标状态: false=停用, true=启用")
+    reason: str = Field(min_length=1, max_length=1000, description="非空原因 (首尾空白归一化后仍须非空)")
