@@ -25,6 +25,7 @@ from .schemas import (
     PublishIn,
     ReviewSubmissionIn,
     ReviewerIn,
+    ReviewerStatusIn,
     ReviewerUpdate,
     SnapshotPublishIn,
 )
@@ -58,6 +59,7 @@ def require_reviewer(
     x_reviewer_id: str = Header(default=None),
     x_reviewer_credential: str = Header(default=None),
 ) -> str:
+    """仅核对评审人凭据 (编号 + 凭据)。凭据格式与既有评审接口约定保持兼容。"""
     if not x_reviewer_id or not x_reviewer_credential:
         raise HTTPException(status_code=401, detail="缺少评审人编号或凭据 (missing reviewer credentials)")
     with db.read_txn() as conn:
@@ -67,6 +69,24 @@ def require_reviewer(
     if row is None or row["credential"] != x_reviewer_credential:
         raise HTTPException(status_code=401, detail="评审人凭据无效 (invalid reviewer credentials)")
     return x_reviewer_id
+
+
+def require_active_reviewer(reviewer_id: str = Depends(require_reviewer)) -> str:
+    """凭据有效之外, 还要求评审资格为启用。
+
+    停用后该评审人现有凭据立即不能取稿、提交决定或评语:
+    凭据本身仍可识别 (不返回 401), 但资格已被会务方停用 -> 403。
+    """
+    with db.read_txn() as conn:
+        row = conn.execute(
+            "SELECT status FROM reviewers WHERE reviewer_id = ?", (reviewer_id,)
+        ).fetchone()
+    if row is None or row["status"] != "enabled":
+        raise HTTPException(
+            status_code=403,
+            detail="该评审人评审资格已停用 (reviewer eligibility is disabled), 请联系会务方",
+        )
+    return reviewer_id
 
 
 # ---------------------------------------------------------------- 工具
@@ -108,6 +128,7 @@ def _load_domain(conn):
                 institution=r["institution"],
                 capacity=r["capacity"],
                 avoid_papers=frozenset(avoids),
+                disabled=r["status"] == "disabled",
             )
         )
     return papers, reviewers
@@ -130,6 +151,7 @@ def _reviewer_row_to_dict(row):
         "institution": row["institution"],
         "capacity": row["capacity"],
         "avoid_papers": json.loads(row["avoid_papers"]),
+        "status": row["status"],
     }
 
 
@@ -206,6 +228,12 @@ def meta(_: bool = Depends(require_organizer)):
     with db.read_txn() as conn:
         rev = db.get_revision(conn)
         published = _load_published(conn)
+        disabled = [
+            r["reviewer_id"]
+            for r in conn.execute(
+                "SELECT reviewer_id FROM reviewers WHERE status = 'disabled' ORDER BY reviewer_id"
+            ).fetchall()
+        ]
         recusals = [
             {
                 "reviewer_id": r["reviewer_id"],
@@ -228,6 +256,7 @@ def meta(_: bool = Depends(require_organizer)):
             else None
         ),
         "hard_recusals": recusals,
+        "disabled_reviewers": disabled,
     }
 
 
@@ -339,6 +368,151 @@ def list_reviewers(_: bool = Depends(require_organizer)):
     with db.read_txn() as conn:
         rows = conn.execute("SELECT * FROM reviewers ORDER BY reviewer_id").fetchall()
     return {"reviewers": [_reviewer_row_to_dict(r) for r in rows]}
+
+
+# ------------------------------------------------ 评审资格停用 / 启用 (会务方)
+
+@app.put("/reviewers/{reviewer_id}/status")
+def update_reviewer_status(
+    reviewer_id: str,
+    body: ReviewerStatusIn,
+    _: bool = Depends(require_organizer),
+):
+    """会务方按评审人编号调整评审资格 (停用 disabled / 启用 enabled)。
+
+    - 请求须携带所见资料修订号 base_revision 与非空原因 reason;
+      在同一个写事务内先核对修订号, 再核对评审人与目标状态;
+    - 修订号过期 (期间发生过资料变更或任何有效状态变更) -> 409, 不改状态;
+      未知评审人 -> 404; 原因为空 (去空白后) -> 422;
+    - 匹配修订号下重复提交"同一状态且同一原因"幂等 (changed=false, 不推进修订号,
+      不新增变更记录); 同状态但原因不同 -> 409 (拒绝, 状态与记录均不变);
+    - 既有评审人初始视为启用, 因此对从未变更过的评审人提交 enabled 视为
+      幂等空操作 (changed=false);
+    - 有效变更推进资料修订号并追加一条变更记录; 基于旧修订号的后续发布/补位发布
+      因此自然按既有规则 409 拒绝。
+    """
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="评审资格变更原因必须非空 (reason is required)")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        rev = db.get_revision(conn)
+        if body.base_revision != rev:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"资料已变更: 请求基于修订号 {body.base_revision}, 当前修订号为 {rev},"
+                    " 请重新获取评审人状态与修订号后再提交"
+                ),
+            )
+        row = conn.execute(
+            "SELECT status FROM reviewers WHERE reviewer_id = ?", (reviewer_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"评审人不存在: {reviewer_id}")
+        current = row["status"]
+        last = conn.execute(
+            "SELECT reason, revision, changed_at FROM reviewer_status_changes"
+            " WHERE reviewer_id = ? ORDER BY id DESC LIMIT 1",
+            (reviewer_id,),
+        ).fetchone()
+
+        if current == body.status:
+            # 初始启用且从无变更记录: 启用请求视为幂等空操作
+            if last is not None and last["reason"] != reason:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "评审资格已是目标状态但原因不同, 拒绝重复变更",
+                        "reviewer_id": reviewer_id,
+                        "status": current,
+                        "existing_reason": last["reason"],
+                    },
+                )
+            return {
+                "ok": True,
+                "reviewer_id": reviewer_id,
+                "status": current,
+                "changed": False,
+                "revision": rev,
+                "reason": last["reason"] if last is not None else reason,
+                "changed_at": last["changed_at"] if last is not None else None,
+            }
+
+        new_rev = db.bump_revision(conn)
+        conn.execute(
+            "UPDATE reviewers SET status = ? WHERE reviewer_id = ?",
+            (body.status, reviewer_id),
+        )
+        conn.execute(
+            "INSERT INTO reviewer_status_changes"
+            "(reviewer_id, status, reason, revision, changed_at) VALUES (?,?,?,?,?)",
+            (reviewer_id, body.status, reason, new_rev, now),
+        )
+    return {
+        "ok": True,
+        "reviewer_id": reviewer_id,
+        "status": body.status,
+        "changed": True,
+        "revision": new_rev,
+        "reason": reason,
+        "changed_at": now,
+    }
+
+
+def _status_change_dict(r):
+    return {
+        "reviewer_id": r["reviewer_id"],
+        "status": r["status"],
+        "reason": r["reason"],
+        "revision": r["revision"],
+        "changed_at": r["changed_at"],
+    }
+
+
+@app.get("/reviewers/{reviewer_id}/status")
+def get_reviewer_status(reviewer_id: str, _: bool = Depends(require_organizer)):
+    """会务方查看某评审人的当前资格与全部停用/启用变更记录。"""
+    with db.read_txn() as conn:
+        row = conn.execute(
+            "SELECT status FROM reviewers WHERE reviewer_id = ?", (reviewer_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"评审人不存在: {reviewer_id}")
+        history = conn.execute(
+            "SELECT reviewer_id, status, reason, revision, changed_at"
+            " FROM reviewer_status_changes WHERE reviewer_id = ? ORDER BY id",
+            (reviewer_id,),
+        ).fetchall()
+        rev = db.get_revision(conn)
+    return {
+        "reviewer_id": reviewer_id,
+        "status": row["status"],
+        "revision": rev,
+        "changes": [_status_change_dict(r) for r in history],
+    }
+
+
+@app.get("/reviewer-status-changes")
+def list_reviewer_status_changes(
+    reviewer_id: str | None = None,
+    _: bool = Depends(require_organizer),
+):
+    """会务方查看评审资格变更记录 (全局, 或按评审人编号过滤)。"""
+    with db.read_txn() as conn:
+        if reviewer_id is not None:
+            rows = conn.execute(
+                "SELECT reviewer_id, status, reason, revision, changed_at"
+                " FROM reviewer_status_changes WHERE reviewer_id = ? ORDER BY id",
+                (reviewer_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT reviewer_id, status, reason, revision, changed_at"
+                " FROM reviewer_status_changes ORDER BY id"
+            ).fetchall()
+    return {"changes": [_status_change_dict(r) for r in rows]}
 
 
 # ---------------------------------------------------------------- 预演 / 发布 (会务方)
@@ -721,7 +895,7 @@ def list_feedback_snapshots(paper_id: str, _: bool = Depends(require_organizer))
 def submit_decision(
     paper_id: str,
     body: AssignmentDecisionIn,
-    reviewer_id: str = Depends(require_reviewer),
+    reviewer_id: str = Depends(require_active_reviewer),
 ):
     """评审人对当前发布版中分配给自己的论文确认接受或声明回避。
 
@@ -832,7 +1006,7 @@ def submit_decision(
 
 
 @app.get("/reviewer/assignments")
-def reviewer_assignments(reviewer_id: str = Depends(require_reviewer)):
+def reviewer_assignments(reviewer_id: str = Depends(require_active_reviewer)):
     """评审人凭自身凭据读取已分配给自己的匿名稿 (仅当前发布版, 不含作者机构)。
 
     - 已回避的论文立即从取稿列表中移除 (仅在 recused 中保留编号与本人填写的原因);
@@ -878,7 +1052,7 @@ def reviewer_assignments(reviewer_id: str = Depends(require_reviewer)):
 def submit_review(
     paper_id: str,
     body: ReviewSubmissionIn,
-    reviewer_id: str = Depends(require_reviewer),
+    reviewer_id: str = Depends(require_active_reviewer),
 ):
     """评审人对当前发布版中"已确认且未回避"的有效任务提交正式评分与评语。
 
@@ -986,7 +1160,7 @@ def submit_review(
 
 
 @app.get("/reviewer/reviews")
-def reviewer_reviews(reviewer_id: str = Depends(require_reviewer)):
+def reviewer_reviews(reviewer_id: str = Depends(require_active_reviewer)):
     """评审人查看本人在当前发布版有效任务上已提交的正式评语。
 
     仅返回当前发布版中分配给本人、且已确认未回避槽位的评语;

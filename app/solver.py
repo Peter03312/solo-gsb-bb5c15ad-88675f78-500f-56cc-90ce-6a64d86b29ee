@@ -35,6 +35,7 @@ class Reviewer:
     institution: str
     capacity: int
     avoid_papers: frozenset
+    disabled: bool = False  # 评审资格已被会务方停用: 不参与任何后续分配/补位
 
 
 def is_expert(reviewer: Reviewer, paper: Paper) -> bool:
@@ -53,7 +54,10 @@ def analyze_paper(paper: Paper, reviewers, recused_pairs=()):
     """
     eligible, excluded = [], []
     for r in reviewers:  # callers 保证 reviewers 已按 reviewer_id 升序
-        if r.institution in paper.institutions:
+        if r.disabled:
+            # 评审资格停用: 不参与后续普通分配与补位, 独立标注排除原因
+            excluded.append({"reviewer_id": r.reviewer_id, "reason": "reviewer_disabled"})
+        elif r.institution in paper.institutions:
             excluded.append({"reviewer_id": r.reviewer_id, "reason": "same_institution_as_author"})
         elif paper.paper_id in r.avoid_papers:
             reason = (
@@ -332,7 +336,10 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=()):
             if rid not in reviewer_by_id:
                 problems.append({"reviewer_id": rid, "reason": "fixed_reviewer_not_found"})
             elif rid in excluded_reason:
-                if (rid, pid) in recused_pairs:
+                if excluded_reason[rid] == "reviewer_disabled":
+                    # 停用者不得进入补位: 即使其槽位已确认也释放为可补位置
+                    problems.append({"reviewer_id": rid, "reason": "reviewer_disabled"})
+                elif (rid, pid) in recused_pairs:
                     problems.append({"reviewer_id": rid, "reason": "hard_recusal_after_decline"})
                 else:
                     problems.append({"reviewer_id": rid, "reason": excluded_reason[rid]})

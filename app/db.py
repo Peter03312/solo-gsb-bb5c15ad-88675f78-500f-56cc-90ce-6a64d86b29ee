@@ -10,6 +10,8 @@
   与评语 (按发布序号隔离; 每个有效槽位至多一份, 以收据 receipt 标识;
   补位发布时连续保留的确认槽位连同评语一起复制到新序号);
 - reviewer_recusals 表保存评审人声明过的硬回避, 后续普通求解与补位都必须遵守;
+- reviewers.status 记录评审资格 (enabled/disabled; 既有评审人初始为 enabled),
+  reviewer_status_changes 表保存会务方每次有效停用/启用变更 (含非空原因与变更后修订号);
 - feedback_snapshots 表保存会务方按论文发布的、面向作者的匿名反馈快照
   (仅当某发布序号下两名评审人均已确认且各提交一份正式评语时生成;
   以 (paper_id, serial, receipt1, receipt2) 幂等, 来源变化即新发布序号 -> version+1
@@ -42,8 +44,13 @@ CREATE TABLE IF NOT EXISTS reviewers (
     topics       TEXT NOT NULL,   -- JSON array
     institution  TEXT NOT NULL,
     capacity     INTEGER NOT NULL CHECK (capacity >= 1),
-    avoid_papers TEXT NOT NULL    -- JSON array
+    avoid_papers TEXT NOT NULL,   -- JSON array
+    status       TEXT NOT NULL DEFAULT 'enabled'
+                 CHECK (status IN ('enabled', 'disabled'))
 );
+-- 评审资格状态 (enabled=启用 / disabled=停用); 既有评审人初始视为启用
+-- (旧库由 _migrate 补列, 默认 enabled)。停用后现有凭据立即失效于评审人接口,
+-- 但既有发布分配、决定、评语不删除。
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -90,6 +97,17 @@ CREATE TABLE IF NOT EXISTS reviewer_recusals (
     created_at       TEXT NOT NULL,
     PRIMARY KEY (reviewer_id, paper_id)
 );
+-- 会务方对评审资格的停用/启用变更记录 (追加写入, 不修改不删除)。
+-- 仅"有效变更" (实际改变状态并推进修订号) 写一行; 幂等重复与被拒请求不写。
+-- revision 为该次变更后 (推进后) 的资料修订号; 会务方可按评审人或全局追溯。
+CREATE TABLE IF NOT EXISTS reviewer_status_changes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    reviewer_id TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
+    reason      TEXT NOT NULL,   -- 会务方填写的非空原因
+    revision    INTEGER NOT NULL,
+    changed_at  TEXT NOT NULL
+);
 -- 面向作者的匿名反馈快照 (会务方按论文发布; 仅当该发布序号下两名评审人均已确认
 -- 且各提交一份正式评语时才允许生成)。
 -- receipt1/receipt2 按方案槽位固定顺序 (评审人编号字典序) 记录两份评语的收据,
@@ -118,6 +136,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(published)").fetchall()}
     if "serial" not in cols:
         conn.execute("ALTER TABLE published ADD COLUMN serial INTEGER NOT NULL DEFAULT 0")
+    reviewer_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(reviewers)").fetchall()
+    }
+    # 既有评审人初始视为启用
+    if "status" not in reviewer_cols:
+        conn.execute(
+            "ALTER TABLE reviewers ADD COLUMN status TEXT NOT NULL DEFAULT 'enabled'"
+        )
 
 
 def get_conn() -> sqlite3.Connection:

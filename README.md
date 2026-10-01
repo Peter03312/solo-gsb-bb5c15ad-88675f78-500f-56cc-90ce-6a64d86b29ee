@@ -21,7 +21,7 @@
 **无完整方案时**：返回最大部分分配、未分配论文清单及每篇的限制原因（合格评审人不足、
 容量占满、无擅长者、机构冲突等），**已发布版本保持不变**。
 
-**版本化发布**：每次资料变更（论文/评审人增删改）使资料修订号 +1；预演返回所依据的修订号，
+**版本化发布**：每次资料变更（论文/评审人增删改、评审资格的有效停用/启用）使资料修订号 +1；预演返回所依据的修订号，
 发布必须携带该修订号，不一致则 `409` 拒绝。校验修订号、重算方案、写入发布版在**同一个
 SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会产生基于旧版资料的方案。
 
@@ -70,6 +70,27 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 - 补位发布成功后发布序号 +1，**仅按新发布版授权取稿**；仍在新方案中的
   （论文, 评审人）槽位**保留其确认状态**，被移出方案的关系不再授权取稿。
 
+**评审资格停用/启用（会务方）**：会务方凭本地密钥按**评审人编号**调整评审资格
+（`PUT /reviewers/{reviewer_id}/status`），请求体携带**所见资料修订号 `base_revision`**、
+**目标状态 `status`（`disabled` 停用 / `enabled` 启用）**与**非空原因 `reason`**，
+并可按人或全局查看变更记录：
+
+- **既有评审人初始视为启用**；停用后该评审人**现有凭据立即不能**取稿、提交决定或评语
+  （凭据本身仍可识别：凭据错误仍 `401`，停用者返回 `403`）；
+- **既有发布分配、确认和评语不删除**：当前发布版仍可供会务方核对（槽位决定状态原样保留），
+  其他评审人取稿不受影响，**已发布的作者反馈快照仍按原有规则有效**；
+- 停用者**不得进入后续普通分配与补位**（求解/补位诊断原因 `reviewer_disabled`，停用者不占容量）；
+  补位时**释放其已确认槽位**（补位预演 `fixed_problems` 标注 `reviewer_disabled`），
+  **其他仍合格的已确认槽位保持固定**；
+- **启用后只恢复当前发布版中仍分配给本人的任务访问**，不找回已被补位替换的槽位或归档评语；
+  若停用期间发布版未变，原确认/评语记录随槽位继续有效；
+- 状态变更在**同一写事务内先核对修订号**：过期修订号 `409`、未知评审人 `404`、
+  空原因 `422`，**拒绝均不改状态**；匹配修订号下**重复提交同一状态和原因**幂等
+  （`changed=false`，**不推进修订号**、不新增记录），**同状态异原因** `409`；
+- **有效变更推进资料修订号**，因此基于旧修订号的普通发布/补位发布按既有规则 `409` 拒绝；
+  对从未变更过的评审人提交 `enabled` 视为幂等空操作（初始即启用）；
+- **现有凭据格式与评审接口约定保持兼容**（仍是 `X-Reviewer-Id` + `X-Reviewer-Credential`）。
+
 **面向作者的匿名反馈快照**：会务方按论文发布（`POST /papers/{paper_id}/feedback-snapshot`，
 请求体携带**当前发布序号 `serial`**）：
 
@@ -91,8 +112,8 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 
 | 角色 | 凭据 | 权限 |
 |---|---|---|
-| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度、发布与追溯面向作者的匿名反馈快照 |
-| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 对已发布方案中分配给自己的任务确认/回避、读取匿名稿（不含作者机构）、提交并查看本人正式评语 |
+| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度、发布与追溯面向作者的匿名反馈快照、停用/启用评审资格并查看变更记录 |
+| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 资格**启用**时：对已发布方案中分配给自己的任务确认/回避、读取匿名稿（不含作者机构）、提交并查看本人正式评语；**停用后凭据立即失去上述访问（403）** |
 | 持码者 | 快照随机访问码（路径参数，无需请求头） | 仅可读取对应论文**当前有效**的匿名反馈快照（论文编号 + 标号 1、2 的评分与评语） |
 
 ## 一键启动（Docker Compose）
@@ -143,13 +164,16 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查（无需凭据） |
-| GET | `/meta` | 当前资料修订号与发布状态 |
+| GET | `/meta` | 当前资料修订号、发布状态、硬回避清单与停用评审人清单（`disabled_reviewers`） |
 | POST | `/papers` | 录入论文（编号/匿名稿/主题/作者机构），重复编号 `409` |
 | PUT / DELETE | `/papers/{paper_id}` | 更新 / 删除论文，不存在 `404` |
 | GET | `/papers` | 论文列表 |
 | POST | `/reviewers` | 录入评审人（编号/凭据/擅长主题/机构/容量/回避论文），重复编号 `409`，非法容量 `422` |
 | PUT / DELETE | `/reviewers/{reviewer_id}` | 更新 / 删除评审人 |
-| GET | `/reviewers` | 评审人列表 |
+| GET | `/reviewers` | 评审人列表（含当前资格 `status`：`enabled`/`disabled`） |
+| PUT | `/reviewers/{reviewer_id}/status` | 停用/启用评审资格：`{"base_revision":N,"status":"disabled"|"enabled","reason":"非空"}`；过期修订号 `409`、未知评审人 `404`、空原因 `422`、同状态异原因 `409`；同状态同原因重复幂等（`changed=false`）；有效变更推进修订号 |
+| GET | `/reviewers/{reviewer_id}/status` | 查看某评审人当前资格与全部停用/启用变更记录 |
+| GET | `/reviewer-status-changes?reviewer_id=...` | 查看评审资格变更记录（全局，或按评审人编号过滤） |
 | POST | `/assignment/dry-run` | 预演：返回方案、未分配论文与限制原因、资料修订号；不影响已发布版 |
 | POST | `/assignment/publish` | 发布：携带 `{"base_revision": N}`，修订号过期 `409`，无可行方案 `422` |
 | POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` |
@@ -172,7 +196,9 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 正式评语收集流程见 [`examples/reviews.sh`](examples/reviews.sh)
 （`./examples/reviews.sh`，建议对新库运行）；
 本轮匿名反馈快照流程见 [`examples/snapshots.sh`](examples/snapshots.sh)
-（`./examples/snapshots.sh`，建议对新库运行）。
+（`./examples/snapshots.sh`，建议对新库运行）；
+本轮评审资格停用/启用流程见 [`examples/status.sh`](examples/status.sh)
+（`./examples/status.sh`，建议对新库运行）。
 
 ```bash
 BASE=http://localhost:8000
@@ -296,6 +322,52 @@ curl $BASE/papers/P1/feedback-snapshots -H "$ORG"
 快照响应不含评审人编号、评审人机构、作者机构、评语收据、发布序号/版本及任何内部诊断字段；
 标号 1、2 的固定顺序为方案槽位顺序（评审人编号字典序）。
 
+### 本轮用法：评审资格停用/启用
+
+```bash
+# 20. 会务方先取当前资料修订号, 再按评审人编号停用 (原因非空; 有效变更推进修订号)
+REV=$(curl -s $BASE/meta -H "$ORG" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')
+curl -s -X PUT $BASE/reviewers/R2/status -H "$ORG" \
+  -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV, \"status\": \"disabled\", \"reason\": \"调查期间暂停评审资格\"}"
+# -> {"ok":true,"reviewer_id":"R2","status":"disabled","changed":true,
+#     "revision":N,"reason":"...","changed_at":"..."}
+
+# 21. 匹配修订号下重复提交同一状态+同一原因 -> changed=false, 不推进修订号、不新增记录
+#     同状态异原因 -> 409; 过期修订号 -> 409 (事务内先核对修订号); 未知评审人 -> 404;
+#     空原因 -> 422; 对从未变更过的评审人提交 enabled -> changed=false 空操作
+
+# 22. 停用立即生效: R2 现有凭据不能取稿/提交决定/评语 (凭据错误仍 401, 停用者 403)
+curl -s -w '<- HTTP %{http_code}\n' $BASE/reviewer/assignments \
+  -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret'   # -> 403
+
+# 23. 补位预演/发布: R2 的已确认槽位释放 (fixed_problems 标 reviewer_disabled),
+#     其他仍合格的已确认槽位保持固定; 停用者不进入普通分配与补位、不占容量
+curl -s -X POST $BASE/assignment/backfill/dry-run -H "$ORG"
+# -> {"plan":{"P1":["R1","R3"]},"fixed":{"P1":["R1"]},
+#     "fixed_problems":{"P1":[{"reviewer_id":"R2","reason":"reviewer_disabled"}]}, ...}
+
+# 24. 重新启用 (启用原因同样必须非空): 只恢复当前发布版仍分配给本人的任务,
+#     不找回已被补位替换的槽位或归档评语
+REV=$(curl -s $BASE/meta -H "$ORG" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')
+curl -s -X PUT $BASE/reviewers/R2/status -H "$ORG" \
+  -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV, \"status\": \"enabled\", \"reason\": \"调查结束恢复资格\"}"
+
+# 25. 查看变更记录: 按人 (当前资格 + 历史) 或全局 (可按 reviewer_id 过滤)
+curl $BASE/reviewers/R2/status -H "$ORG"
+# -> {"reviewer_id":"R2","status":"enabled","revision":N,
+#     "changes":[{"status":"disabled","reason":"...","revision":..,"changed_at":"..."},
+#                {"status":"enabled","reason":"...","revision":..,"changed_at":"..."}]}
+curl "$BASE/reviewer-status-changes" -H "$ORG"
+curl "$BASE/reviewer-status-changes?reviewer_id=R2" -H "$ORG"
+```
+
+停用/启用**不删除**任何既有发布分配、确认、正式评语与作者反馈快照：会务方仍可在
+`GET /assignment`、`GET /papers/P1/reviews` 中原样核对；已发布快照的访问码在发布序号
+不变时继续有效。`GET /reviewers` 每条记录含当前 `status`，`GET /meta` 含
+`disabled_reviewers` 清单。完整脚本见 [`examples/status.sh`](examples/status.sh)。
+
 预演响应示例（可行）：
 
 ```json
@@ -332,12 +404,14 @@ curl $BASE/papers/P1/feedback-snapshots -H "$ORG"
 | 状态码 | 场景 |
 |---|---|
 | 401 | 会务方密钥缺失/错误；评审人凭据缺失/失效 |
-| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布；反馈快照的访问码无效或已失效（旧码，不区分论文是否存在）；未发布或论文不在当前发布版时发布快照 |
-| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突）；反馈快照请求携带的发布序号过期/超前 |
-| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致；发布反馈快照时两名评审人未全部确认或两份正式评语未交齐（不留下新版本） |
+| 403 | 评审人凭据有效但评审资格已被会务方停用：取稿、提交决定、提交/查看评语一律拒绝 |
+| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布；反馈快照的访问码无效或已失效（旧码，不区分论文是否存在）；未发布或论文不在当前发布版时发布快照；查看/变更**未知评审人**的资格状态 |
+| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突）；反馈快照请求携带的发布序号过期/超前；评审资格变更携带的修订号已过期，或同状态提交了不同原因 |
+| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致；发布反馈快照时两名评审人未全部确认或两份正式评语未交齐（不留下新版本）；评审资格变更原因为空（去首尾空白后） |
 
 排除/限制原因代码：`same_institution_as_author`（与作者同机构）、`on_reviewer_avoid_list`
 （在回避名单）、`hard_recusal_after_decline`（评审人发布后声明回避形成的硬回避）、
+`reviewer_disabled`（评审资格已被会务方停用；普通分配/补位排除、补位时释放其已确认槽位）、
 `fewer_than_two_eligible_reviewers`（合格者不足两人）、
 `eligible_reviewers_at_capacity`（合格者容量占满）、`no_expert_among_eligible_reviewers`
 （合格者无人擅长主题）、`eligible_reviewers_share_single_institution`（合格者同属一个机构）、
@@ -353,18 +427,20 @@ curl $BASE/papers/P1/feedback-snapshots -H "$ORG"
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照
-  solver.py   # 分配求解器 + 补位求解器（固定位置、容量比例、字典序、部分方案与诊断）
-  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务
+  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照、评审资格停用/启用
+  solver.py   # 分配求解器 + 补位求解器（固定位置、停用/回避排除、容量比例、字典序、部分方案与诊断）
+  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、评审资格与变更记录、读写事务
   schemas.py  # 请求体模型与校验
 tests/test_api.py         # 原有接口与求解器测试（含并发发布测试）
 tests/test_backfill.py    # 确认/回避/硬回避/补位预演与发布测试
 tests/test_reviews.py     # 正式评分/评语、收据幂等与冲突、进度与归档、补位沿用测试
-tests/test_snapshots.py   # 本轮匿名反馈快照：发布门槛、幂等原码、新版本旧码失效、统一 404、追溯
+tests/test_snapshots.py   # 匿名反馈快照：发布门槛、幂等原码、新版本旧码失效、统一 404、追溯
+tests/test_status.py      # 本轮评审资格：停用即失权、数据不删除、补位释放槽位、启用恢复语义、修订号/幂等/拒绝规则
 examples/demo.sh          # 端到端 curl 示例（录入 -> 预演 -> 发布 -> 取稿）
 examples/backfill.sh      # 确认/回避 -> 补位预演 -> 双版本复核发布示例
 examples/reviews.sh       # 正式评语收集端到端示例（确认 -> 提交评语 -> 进度查看 -> 补位沿用/归档）
-examples/snapshots.sh     # 本轮端到端示例（发布快照 -> 持码读取 -> 幂等 -> 序号变化旧码失效 -> 追溯）
+examples/snapshots.sh     # 匿名反馈快照端到端示例（发布快照 -> 持码读取 -> 幂等 -> 序号变化旧码失效 -> 追溯）
+examples/status.sh        # 本轮端到端示例（停用 -> 凭据 403 -> 补位释放 -> 幂等/拒绝规则 -> 启用恢复 -> 变更记录）
 Dockerfile / docker-compose.yml
 ```
 

@@ -60,3 +60,11 @@ class ReviewSubmissionIn(BaseModel):
 
 class SnapshotPublishIn(BaseModel):
     serial: int = Field(ge=1, description="要发布的反馈快照所依据的发布序号; 与当前发布序号不一致即过期")
+
+
+class ReviewerStatusIn(BaseModel):
+    base_revision: int = Field(ge=0, description="所见资料修订号; 与当前修订号不一致即过期拒绝")
+    status: Literal["enabled", "disabled"] = Field(
+        description="目标评审资格: disabled=停用, enabled=启用"
+    )
+    reason: str = Field(min_length=1, max_length=1000, description="变更原因; 去除首尾空白后必须非空")
